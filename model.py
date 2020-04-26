@@ -1,86 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-class MyVariableRNN(nn.Module):
-	def __init__(self, dim_input, rnn_dim, hidden_dim):
-		super(MyVariableRNN, self).__init__()
-		self.input_layer1 = nn.Linear(in_features=dim_input, out_features=rnn_dim) #unimproved model
-		self.rnn_model = nn.GRU(input_size=rnn_dim, hidden_size=hidden_dim, num_layers=1, batch_first=True) #unimproved model
-		self.input_layer2 = nn.Linear(in_features=hidden_dim, out_features=2) #unimproved model
-
-	def forward(self, input_tuple):
-		seqs, lengths = input_tuple
-		seqs = torch.tanh(self.input_layer1(seqs)) #unimproved model
-		seqs = pack_padded_sequence(seqs, lengths, batch_first=True) #unimproved model
-		seqs, h = self.rnn_model(seqs) #unimproved model
-		seqs, _ = pad_packed_sequence(seqs, batch_first=True) #unimproved model
-		seqs = self.input_layer2(seqs[:, -1, :]) #unimproved model
-		return seqs
-
-
-
-
-
-class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, device):
-        super(EncoderRNN, self).__init__()
-        self.hidden_size = hidden_size
-
-        self.embedding = nn.Linear(input_size, hidden_size)#nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-
-        self.device = device
-
-    def forward(self, input, hidden):
-        embedded = self.embedding(input).view(1, 1, -1)
-        output = embedded
-        output, hidden = self.gru(output, hidden)
-        return output, hidden
-
-    def initHidden(self):
-        return torch.zeros(1, 1, self.hidden_size, device=self.device)
-
-class AttnDecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size, device, max_length, dropout_p=0.1):
-        super(AttnDecoderRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        self.dropout_p = dropout_p
-        self.max_length = max_length
-
-        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
-        self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
-        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
-        self.dropout = nn.Dropout(self.dropout_p)
-        self.gru = nn.GRU(self.hidden_size, self.hidden_size)
-        self.out = nn.Linear(self.hidden_size, self.output_size)
-
-        self.device = device
-
-    def forward(self, input, hidden, encoder_outputs):
-        embedded = self.embedding(input).view(1, 1, -1)
-        embedded = self.dropout(embedded)
-
-        attn_weights = F.softmax(
-            self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
-        attn_applied = torch.bmm(attn_weights.unsqueeze(0),
-                                 encoder_outputs.unsqueeze(0))
-
-        output = torch.cat((embedded[0], attn_applied[0]), 1)
-        output = self.attn_combine(output).unsqueeze(0)
-
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
-
-        output = F.log_softmax(self.out(output[0]), dim=1)
-        return output, hidden, attn_weights
-
-    def initHidden(self):
-        return torch.zeros(1, 1, self.hidden_size, device=self.device)
-
-
+import numpy as np
+# Adopted from https://github.com/MaximumEntropy/Seq2Seq-PyTorch
+# citation in paper
 class SoftDotAttention(nn.Module):
     """Soft Dot Attention.
     Ref: http://www.aclweb.org/anthology/D15-1166
@@ -115,7 +41,8 @@ class SoftDotAttention(nn.Module):
 
         return h_tilde, attn
 
-
+# Adopted from https://github.com/MaximumEntropy/Seq2Seq-PyTorch
+# citation in paper
 class LSTMAttentionDot(nn.Module):
     r"""A long short-term memory (LSTM) cell with attention."""
 
@@ -167,168 +94,44 @@ class LSTMAttentionDot(nn.Module):
             output = output.transpose(0, 1)
 
         return output, hidden
-
-class MySeq2SeqAttention(nn.Module):
-    def __init__(self, src_dim, src_hidden_dim, trg_dim, trg_hidden_dim, bidirectional=True, nlayers=2, dropout=0., device=torch.device('cpu')):
-        self.dropout = dropout
-        self.nlayers = nlayers
-        self.bidirectional = bidirectional
-        self.src_dim = src_dim
-        self.trg_dim = trg_dim
-        self.trg_hidden_dim = trg_hidden_dim
-        self.src_hidden_dim = src_hidden_dim // 2 \
-                    if self.bidirectional else src_hidden_dim
-        self.num_directions = 2 if bidirectional else 1
-
-        self.device = device
-
-        super(MySeq2SeqAttention, self).__init__()
-
-        self.linear_src = nn.Linear(self.src_dim, self.src_dim)
-        self.linear_trg = nn.Linear(self.trg_dim, self.trg_dim)
-
-        self.encoder = nn.LSTM(
-            self.src_dim,
-            self.src_hidden_dim,
-            nlayers,
-            bidirectional=bidirectional,
-            batch_first=True,
-            dropout=self.dropout
-        )
-
-        self.decoder = LSTMAttentionDot(
-            trg_dim,
-            trg_hidden_dim,
-            batch_first=True
-        )
-
-        self.encoder2decoder = nn.Linear(
-            self.src_hidden_dim * self.num_directions,
-            trg_hidden_dim
-        )
-
-        self.decoder2output = nn.Linear(trg_hidden_dim, trg_dim)
-
-    def forward(self, input_src, input_trg, trg_mask=None, ctx_mask=None):
-        """Propogate input through the network."""
-        # src_emb = self.src_embedding(input_src)
-        # trg_emb = self.trg_embedding(input_trg)
-        src_emb = self.linear_src(input_src)
-        trg_emb = self.linear_trg(input_trg)
-
-        self.h0_encoder, self.c0_encoder = self.get_state(input_src)
-
-        src_h, (src_h_t, src_c_t) = self.encoder(
-            src_emb, (self.h0_encoder, self.c0_encoder)
-        )
-
-        if self.bidirectional:
-            h_t = torch.cat((src_h_t[-1], src_h_t[-2]), 1)
-            c_t = torch.cat((src_c_t[-1], src_c_t[-2]), 1)
-        else:
-            h_t = src_h_t[-1]
-            c_t = src_c_t[-1]
-        decoder_init_state = nn.Tanh()(self.encoder2decoder(h_t))
-
-        ctx = src_h.transpose(0, 1)
-
-        trg_h, (_, _) = self.decoder(
-            trg_emb,
-            (decoder_init_state, c_t),
-            ctx,
-            ctx_mask
-        )
-
-        trg_h_reshape = trg_h.contiguous().view(
-            trg_h.size()[0] * trg_h.size()[1],
-            trg_h.size()[2]
-        )
-        decoder_logit = self.decoder2output(trg_h_reshape)
-        decoder_logit = decoder_logit.view(
-            trg_h.size()[0],
-            trg_h.size()[1],
-            decoder_logit.size()[1]
-        )
-        return decoder_logit
-
-    def decode(self, logits):
-        """Return probability distribution over words."""
-        logits_reshape = logits.view(-1, self.trg_vocab_size)
-        word_probs = F.softmax(logits_reshape)
-        word_probs = word_probs.view(
-            logits.size()[0], logits.size()[1], logits.size()[2]
-        )
-        return word_probs
-
-    def get_state(self, input):
-        """Get cell states and hidden states."""
-        batch_size = input.size(0) \
-            if self.encoder.batch_first else input.size(1)
-        h0_encoder = Variable(torch.zeros(
-            self.encoder.num_layers * self.num_directions,
-            batch_size,
-            self.src_hidden_dim
-        ), requires_grad=False)
-        c0_encoder = Variable(torch.zeros(
-            self.encoder.num_layers * self.num_directions,
-            batch_size,
-            self.src_hidden_dim
-        ), requires_grad=False)
-
-        return h0_encoder.to(self.device), c0_encoder.to(self.device)
-
-class Seq2SeqAttention(nn.Module):
+# Modified from https://github.com/MaximumEntropy/Seq2Seq-PyTorch
+# citation in paper
+class MySeq2SeqFastAttention(nn.Module):
     """Container module with an encoder, deocder, embeddings."""
 
     def __init__(
         self,
+        trg_dim,
         src_emb_dim,
         trg_emb_dim,
-        src_vocab_size,
-        trg_vocab_size,
-        src_hidden_dim,
-        trg_hidden_dim,
-        ctx_hidden_dim,
-        attention_mode,
+        hidden_dim,
         batch_size,
-        pad_token_src,
-        pad_token_trg,
         bidirectional=True,
         nlayers=2,
         nlayers_trg=2,
         dropout=0.,
+        device=torch.device('cpu')
     ):
-        """Initialize model."""
-        super(Seq2SeqAttention, self).__init__()
-        self.src_vocab_size = src_vocab_size
-        self.trg_vocab_size = trg_vocab_size
+        """Create all of the layers."""
+        super(MySeq2SeqFastAttention, self).__init__()
         self.src_emb_dim = src_emb_dim
         self.trg_emb_dim = trg_emb_dim
-        self.src_hidden_dim = src_hidden_dim
-        self.trg_hidden_dim = trg_hidden_dim
-        self.ctx_hidden_dim = ctx_hidden_dim
-        self.attention_mode = attention_mode
+        self.trg_dim = trg_dim
+        self.src_hidden_dim = hidden_dim
+        self.trg_hidden_dim = hidden_dim
         self.batch_size = batch_size
         self.bidirectional = bidirectional
         self.nlayers = nlayers
         self.dropout = dropout
         self.num_directions = 2 if bidirectional else 1
-        self.pad_token_src = pad_token_src
-        self.pad_token_trg = pad_token_trg
-
-        self.src_embedding = nn.Embedding(
-            src_vocab_size,
-            src_emb_dim,
-            self.pad_token_src
-        )
-        self.trg_embedding = nn.Embedding(
-            trg_vocab_size,
-            trg_emb_dim,
-            self.pad_token_trg
-        )
-
-        self.src_hidden_dim = src_hidden_dim // 2 \
-            if self.bidirectional else src_hidden_dim
+        self.device = device
+        # inputs and outputs are now linear layers instead
+        self.src_embedding = nn.Linear(1, src_emb_dim)
+        self.trg_embedding = nn.Linear(self.trg_dim, trg_emb_dim)
+        # only tested with bidirectional=true
+        self.src_hidden_dim = self.src_hidden_dim // 2 \
+            if self.bidirectional else self.src_hidden_dim
+        # encoder and decoder are LSTM networks
         self.encoder = nn.LSTM(
             src_emb_dim,
             self.src_hidden_dim,
@@ -338,25 +141,26 @@ class Seq2SeqAttention(nn.Module):
             dropout=self.dropout
         )
 
-        self.decoder = LSTMAttentionDot(
+        self.decoder = nn.LSTM(
             trg_emb_dim,
-            trg_hidden_dim,
-            batch_first=True
+            self.trg_hidden_dim,
+            nlayers_trg,
+            batch_first=True,
+            dropout=self.dropout
         )
-
+        # passthrough layer is still linear
         self.encoder2decoder = nn.Linear(
             self.src_hidden_dim * self.num_directions,
-            trg_hidden_dim
+            self.trg_hidden_dim
         )
-        self.decoder2vocab = nn.Linear(trg_hidden_dim, trg_vocab_size)
-
+        # final out is also still linear
+        self.decoder2vocab = nn.Linear(2 * self.trg_hidden_dim, trg_dim)
+        # initialize last 2 layers to start with 0 bias
         self.init_weights()
 
     def init_weights(self):
         """Initialize weights."""
-        initrange = 0.1
-        self.src_embedding.weight.data.uniform_(-initrange, initrange)
-        self.trg_embedding.weight.data.uniform_(-initrange, initrange)
+        # initializes the last 2 linear layers to start with 0 bias
         self.encoder2decoder.bias.data.fill_(0)
         self.decoder2vocab.bias.data.fill_(0)
 
@@ -375,39 +179,56 @@ class Seq2SeqAttention(nn.Module):
             self.src_hidden_dim
         ), requires_grad=False)
 
-        return h0_encoder.to(device), c0_encoder.to(device)
+        return h0_encoder.to(self.device), c0_encoder.to(self.device)
 
     def forward(self, input_src, input_trg, trg_mask=None, ctx_mask=None):
         """Propogate input through the network."""
+
         src_emb = self.src_embedding(input_src)
         trg_emb = self.trg_embedding(input_trg)
 
-        self.h0_encoder, self.c0_encoder = self.get_state(input_src)
+        src_emb = src_emb.view(1, src_emb.shape[0], self.src_emb_dim)
+        trg_emb = trg_emb.view(1, trg_emb.shape[0], self.trg_emb_dim)
+
+        self.h0_encoder, self.c0_encoder = self.get_state(src_emb)
 
         src_h, (src_h_t, src_c_t) = self.encoder(
             src_emb, (self.h0_encoder, self.c0_encoder)
-        )
+        )  # bsize x seqlen x dim
 
-        if self.bidirectional:
-            h_t = torch.cat((src_h_t[-1], src_h_t[-2]), 1)
-            c_t = torch.cat((src_c_t[-1], src_c_t[-2]), 1)
-        else:
-            h_t = src_h_t[-1]
-            c_t = src_c_t[-1]
+        h_t = src_h_t.view(-1, self.src_hidden_dim * self.num_directions)
+        c_t = src_c_t.view(-1, self.src_hidden_dim * self.num_directions)
+
         decoder_init_state = nn.Tanh()(self.encoder2decoder(h_t))
-
-        ctx = src_h.transpose(0, 1)
 
         trg_h, (_, _) = self.decoder(
             trg_emb,
-            (decoder_init_state, c_t),
-            ctx,
-            ctx_mask
-        )
+            (
+                decoder_init_state.view(
+                    self.decoder.num_layers,
+                    1,
+                    self.trg_hidden_dim
+                ),
+                c_t.view(
+                    self.decoder.num_layers,
+                    1,
+                    self.trg_hidden_dim
+                )
+            )
+        )  # bsize x seqlen x dim
 
-        trg_h_reshape = trg_h.contiguous().view(
-            trg_h.size()[0] * trg_h.size()[1],
-            trg_h.size()[2]
+        # Fast Attention dot product
+
+        # bsize x seqlen_src x seq_len_trg
+        alpha = torch.bmm(src_h, trg_h.transpose(1, 2))
+        # bsize x seq_len_trg x dim
+        alpha = torch.bmm(alpha.transpose(1, 2), src_h)
+        # bsize x seq_len_trg x (2 * dim)
+        trg_h_reshape = torch.cat((trg_h, alpha), 2)
+
+        trg_h_reshape = trg_h_reshape.view(
+            trg_h_reshape.size(0) * trg_h_reshape.size(1),
+            trg_h_reshape.size(2)
         )
         decoder_logit = self.decoder2vocab(trg_h_reshape)
         decoder_logit = decoder_logit.view(
@@ -418,11 +239,8 @@ class Seq2SeqAttention(nn.Module):
         return decoder_logit
 
     def decode(self, logits):
-        """Return probability distribution over words."""
-        logits_reshape = logits.view(-1, self.trg_vocab_size)
-        word_probs = F.softmax(logits_reshape)
-        word_probs = word_probs.view(
-            logits.size()[0], logits.size()[1], logits.size()[2]
-        )
-        return word_probs
-
+        """
+        Turns a 1 hot array of class probabilities 
+        to classifications based on the most likely
+        """
+        return np.argmax(logits.detach().numpy(), axis=2)
